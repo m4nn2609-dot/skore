@@ -1,0 +1,517 @@
+"""Tests for EstimatorReport.metrics.summarize().
+
+Organised by metric input type, then corner cases:
+
+- Default metrics — by ML task variant
+- Metric strings — skore built-in registry names
+- pos_label
+- Cache and data_source
+"""
+
+import numpy as np
+import pandas as pd
+import pytest
+from numpy.testing import assert_array_equal
+from pandas.testing import assert_frame_equal
+from sklearn.base import clone
+from sklearn.datasets import make_classification
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import make_scorer, precision_score, r2_score, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+
+from skore import EstimatorReport, MetricsSummaryDisplay
+from skore._utils.testing import check_cache_changed, check_cache_unchanged
+
+
+def check_display_structure(
+    display,
+    *,
+    expected_metrics,
+    expected_estimator=None,
+    expected_data_source="test",
+    expected_greater_is_better=None,
+    expected_average=None,
+):
+    """Check the full structure of a MetricsSummaryDisplay.summary DataFrame."""
+    assert isinstance(display.summary, pd.DataFrame)
+    data = display.summary
+
+    assert set(data.columns) == {
+        "name",
+        "verbose_name",
+        "estimator",
+        "data_source",
+        "label",
+        "average",
+        "output",
+        "score",
+        "greater_is_better",
+    }
+    assert pd.api.types.is_numeric_dtype(data["score"])
+    assert set(data["verbose_name"]) == expected_metrics
+    assert set(data["estimator"]) == {expected_estimator}
+    assert set(data["data_source"]) == {expected_data_source}
+    if expected_average is not None:
+        assert set(data["average"].dropna()) == expected_average
+    if expected_greater_is_better is None:
+        expected_greater_is_better = {True, False}
+    assert set(data["greater_is_better"]) == expected_greater_is_better
+
+
+# Default metrics
+
+
+@pytest.mark.parametrize("metric", [None, [], ()])
+def test_default(forest_binary_classification_with_test, metric):
+    """If no metric is passed then use the ML task defaults."""
+    estimator, X_test, y_test = forest_binary_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+
+    display = report.metrics.summarize(metric=metric)
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Log loss",
+            "Brier score",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="RandomForestClassifier",
+    )
+
+
+def test_default_binary_classification_svc(svc_binary_classification_with_test):
+    """If a model has no predict_proba then it will have no Log loss or Brier score."""
+    estimator, X_test, y_test = svc_binary_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test, pos_label=1)
+    display = report.metrics.summarize()
+
+    assert isinstance(display.summary, pd.DataFrame)
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="SVC",
+    )
+
+
+def test_default_multiclass_classification_forest(
+    forest_multiclass_classification_with_test,
+):
+    """Multiclass classification with RandomForestClassifier."""
+    estimator, X_test, y_test = forest_multiclass_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Log loss",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Predict time (s)",
+            "Fit time (s)",
+        },
+        expected_estimator="RandomForestClassifier",
+        expected_average={"macro"},
+    )
+
+    assert "precision_avg" in report.metrics.available()
+
+    assert display.summary["output"].isna().all()
+    data = display.summary.set_index("verbose_name")
+    per_label = data.loc["Precision"].dropna(subset=["label"])
+    assert len(per_label) == 3
+    assert len(data.loc["Recall"].dropna(subset=["label"])) == 3
+    assert set(per_label["label"]) == {0, 1, 2}
+
+
+def test_name_is_registry_key(forest_multiclass_classification_with_test):
+    """Rows are named after the registry key, for built-in and custom metrics alike."""
+    estimator, X_test, y_test = forest_multiclass_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    report.metrics.add(
+        make_scorer(precision_score, average="weighted"), name="precision_weighted"
+    )
+
+    names = set(report.metrics.summarize().summary["name"])
+
+    # `score` is the only registered metric that `summarize` skips here, because
+    # RandomForestClassifier uses the default `ClassifierMixin.score`.
+    assert names == set(report.metrics.available()) - {"score"}
+    assert {"precision", "precision_avg", "precision_weighted"} <= names
+
+
+def test_default_multiclass_classification_svc(svc_multiclass_classification_with_test):
+    """Multiclass classification with SVC (no predict_proba)."""
+    estimator, X_test, y_test = svc_multiclass_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="SVC",
+    )
+
+    assert display.summary["output"].isna().all()
+    data = display.summary.set_index("verbose_name")
+    per_label = data.loc["Precision"].dropna(subset=["label"])
+    assert len(per_label) == 3
+    assert len(data.loc["Recall"].dropna(subset=["label"])) == 3
+    assert set(per_label["label"]) == {0, 1, 2}
+
+
+def test_default_regression(linear_regression_with_test):
+    """Regression with LinearRegression."""
+    estimator, X_test, y_test = linear_regression_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "R²",
+            "RMSE",
+            "MAE",
+            "MAPE",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="LinearRegression",
+    )
+
+    assert display.summary["label"].isna().all()
+    assert display.summary["output"].isna().all()
+
+
+def test_default_multioutput_regression(linear_regression_multioutput_with_test):
+    """Multioutput regression with LinearRegression."""
+    estimator, X_test, y_test = linear_regression_multioutput_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "R²",
+            "RMSE",
+            "MAE",
+            "MAPE",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="LinearRegression",
+    )
+
+    assert display.summary["label"].isna().all()
+    data = display.summary.set_index("verbose_name")
+    assert len(data.loc["R²", "output"]) == 2
+    assert len(data.loc["RMSE", "output"]) == 2
+    assert set(data.loc["R²", "output"]) == {0, 1}
+
+
+@pytest.mark.parametrize(
+    "multioutput, expected_average",
+    [
+        ("raw_values", None),
+        ("uniform_average", "uniform_average"),
+        ("variance_weighted", "variance_weighted"),
+        ([0.3, 0.7], "weighted"),
+        (np.array([0.3, 0.7]), "weighted"),
+    ],
+)
+def test_multioutput_regression_average(
+    linear_regression_multioutput_with_test, multioutput, expected_average
+):
+    """`multioutput` aggregation modes are reported in the `average` column."""
+    estimator, X_test, y_test = linear_regression_multioutput_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    report.metrics.add(make_scorer(r2_score, multioutput=multioutput), name="r2_custom")
+
+    data = report.metrics.summarize().summary
+    rows = data[data["name"] == "r2_custom"]
+
+    if expected_average is None:
+        assert set(rows["output"]) == {0, 1}
+        assert rows["average"].isna().all()
+    else:
+        assert len(rows) == 1
+        assert rows["output"].isna().all()
+        assert rows["average"].iloc[0] == expected_average
+
+
+def test_default_without_predict_proba(custom_classifier_no_predict_proba_with_test):
+    """Default metrics skip roc_auc, log_loss, and brier_score without predict_proba."""
+    estimator, X_test, y_test = custom_classifier_no_predict_proba_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="CustomClassifierPredictOnly",
+    )
+
+
+@pytest.mark.parametrize("wrap_in_pipeline", [False, True])
+@pytest.mark.parametrize("has_custom_score", [False, True])
+def test_default_non_standard_score(
+    binary_classification_data, wrap_in_pipeline, has_custom_score
+):
+    """
+    If the estimator has a non-standard `.score` method, `summarize` will include it.
+    """
+
+    class CustomScoreEstimator(RandomForestClassifier):
+        def score(self, X, y):
+            return 1
+
+    X, y = binary_classification_data
+    predictor = CustomScoreEstimator() if has_custom_score else RandomForestClassifier()
+    estimator = make_pipeline(PCA(), predictor) if wrap_in_pipeline else predictor
+    report = EstimatorReport(estimator, X_train=X, y_train=y, X_test=X, y_test=y)
+    display = report.metrics.summarize()
+
+    expected_metrics = {
+        "Brier score",
+        "Log loss",
+        "ROC AUC",
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "Fit time (s)",
+        "Predict time (s)",
+    }
+    if has_custom_score:
+        expected_metrics.add("Score")
+    check_display_structure(
+        display,
+        expected_metrics=expected_metrics,
+        expected_estimator=predictor.__class__.__name__,
+    )
+
+
+# Metric strings
+
+
+def test_string_plain(linear_regression_with_test):
+    """A list of skore built-in metric strings resolves to correct display names."""
+    estimator, X_test, y_test = linear_regression_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+
+    display = report.metrics.summarize(metric=["r2", "rmse"])
+
+    check_display_structure(
+        display,
+        expected_metrics={"R²", "RMSE"},
+        expected_estimator="LinearRegression",
+    )
+
+
+# pos_label
+
+
+def test_pos_label(forest_binary_classification_with_test):
+    """pos_label collapses per-class metrics to a single row."""
+    estimator, X_test, y_test = forest_binary_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test, pos_label=1)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Log loss",
+            "Brier score",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="RandomForestClassifier",
+    )
+
+    assert len(display.summary[display.summary["verbose_name"] == "Precision"]) == 1
+    assert len(display.summary[display.summary["verbose_name"] == "Recall"]) == 1
+    assert display.summary["label"].isna().all()
+    assert display.summary["output"].isna().all()
+
+
+def test_pos_label_strings(forest_binary_classification_with_test):
+    """Binary classification with string labels."""
+    estimator, X_test, y_test = forest_binary_classification_with_test
+
+    target_names = np.array(["neg", "pos"], dtype=object)
+    y_test = target_names[y_test]
+
+    estimator = clone(estimator).fit(X_test, y_test)
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+
+    display = report.metrics.summarize()
+    assert isinstance(display.summary, pd.DataFrame)
+    assert set(display.summary["verbose_name"]) == {
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "ROC AUC",
+        "Log loss",
+        "Brier score",
+        "Fit time (s)",
+        "Predict time (s)",
+    }
+
+    labels = display.summary.set_index("verbose_name").loc["Precision", "label"]
+    assert set(labels) == {"neg", "pos"}
+
+
+def test_pos_label_bool(forest_binary_classification_with_test):
+    """Binary classification with boolean labels."""
+    estimator, X_test, y_test = forest_binary_classification_with_test
+
+    target_names = np.array([False, True], dtype=bool)
+    y_test = target_names[y_test]
+
+    estimator = clone(estimator).fit(X_test, y_test)
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+
+    display = report.metrics.summarize()
+    assert isinstance(display.summary, pd.DataFrame)
+    assert set(display.summary["verbose_name"]) == {
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "ROC AUC",
+        "Log loss",
+        "Brier score",
+        "Fit time (s)",
+        "Predict time (s)",
+    }
+
+    labels = display.summary.set_index("verbose_name").loc["Precision", "label"]
+    assert any(label is np.False_ for label in labels)
+    assert any(label is np.True_ for label in labels)
+
+
+@pytest.mark.parametrize(
+    "metric, metric_fn", [("precision", precision_score), ("recall", recall_score)]
+)
+def test_pos_label_overwrite(metric, metric_fn):
+    """pos_label can be set when creating the report."""
+    X, y = make_classification(
+        n_classes=2, class_sep=0.8, weights=[0.4, 0.6], random_state=0
+    )
+    labels = np.array(["A", "B"], dtype=object)
+    y = labels[y]
+    classifier = LogisticRegression().fit(X, y)
+
+    # Without pos_label - should have multiple rows (one per class)
+    report = EstimatorReport(classifier, X_test=X, y_test=y)
+    display = report.metrics.summarize(metric=metric)
+    assert isinstance(display.summary, pd.DataFrame)
+    assert len(display.summary) == 2
+    assert set(display.summary["label"]) == {"A", "B"}
+
+    # With pos_label="B" - should have single row
+    report = EstimatorReport(classifier, X_test=X, y_test=y, pos_label="B")
+    display = report.metrics.summarize(metric=metric)
+    assert len(display.summary) == 1
+    score_B = display.summary["score"].values[0]
+    assert score_B == pytest.approx(metric_fn(y, classifier.predict(X), pos_label="B"))
+
+    # With pos_label="A" - should have single row
+    report = EstimatorReport(classifier, X_test=X, y_test=y, pos_label="A")
+    display = report.metrics.summarize(metric=metric)
+    assert len(display.summary) == 1
+    score_A = display.summary["score"].values[0]
+    assert score_A == pytest.approx(metric_fn(y, classifier.predict(X), pos_label="A"))
+
+
+# Cache
+
+
+def test_cache(forest_binary_classification_with_test):
+    """summarize() results are cached; second call returns the same data."""
+    estimator, X_test, y_test = forest_binary_classification_with_test
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+
+    with check_cache_changed(report._cache):
+        result = report.metrics.summarize()
+    assert isinstance(result, MetricsSummaryDisplay)
+
+    with check_cache_unchanged(report._cache):
+        result_from_cache = report.metrics.summarize()
+    assert_frame_equal(result.summary, result_from_cache.summary)
+
+
+@pytest.mark.parametrize(
+    "metric, fixture",
+    [
+        ("predict_time", "forest_binary_classification_with_test"),
+        ("precision", "forest_binary_classification_with_test"),
+        ("roc_auc", "forest_binary_classification_with_test"),
+        ("r2", "linear_regression_with_test"),
+    ],
+)
+def test_cache_interaction(request, metric, fixture):
+    """Calling a metric explicitly after calling summarize() should hit the cache."""
+    estimator, X_test, y_test = request.getfixturevalue(fixture)
+    report = EstimatorReport(estimator, X_test=X_test, y_test=y_test)
+    report.metrics.summarize(metric=metric)
+
+    with check_cache_unchanged(report._cache):
+        getattr(report.metrics, metric)()
+
+
+# Data source
+
+
+def test_data_source_both(forest_binary_classification_data):
+    """data_source='both' concatenates train and test results."""
+    estimator, X, y = forest_binary_classification_data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=42)
+
+    report = EstimatorReport(
+        estimator, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test
+    )
+
+    display_train = report.metrics.summarize(data_source="train")
+    display_test = report.metrics.summarize(data_source="test")
+    display_both = report.metrics.summarize(data_source="both")
+
+    assert set(display_both.summary["data_source"]) == {"train", "test"}
+
+    train_data = display_both.summary[display_both.summary["data_source"] == "train"]
+    assert_array_equal(train_data["score"], display_train.summary["score"])
+
+    test_data = display_both.summary[display_both.summary["data_source"] == "test"]
+    assert_array_equal(test_data["score"], display_test.summary["score"])

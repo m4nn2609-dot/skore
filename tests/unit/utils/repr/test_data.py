@@ -1,0 +1,673 @@
+"""Unit tests for helpers in ``skore._utils.repr.data``."""
+
+import re
+from typing import ClassVar
+from urllib.parse import quote
+
+import numpy as np
+import pytest
+from sklearn.linear_model import LogisticRegression
+
+import skore._utils.repr.data as data_module
+from skore._utils.repr.data import (
+    AccessorHelpData,
+    DisplayHelpData,
+    HelpSection,
+    MethodGroupHelp,
+    MethodHelp,
+    ReportHelpData,
+    _AccessorHelpDataMixin,
+    _build_attribute_text_fragment,
+    _DisplayHelpDataMixin,
+    _get_attribute_type,
+    _ReportHelpDataMixin,
+    get_attribute_short_summary,
+    get_documentation_url,
+    get_method_short_summary,
+    get_public_attributes,
+    get_public_methods,
+)
+from skore._utils.testing import MockAccessor, MockDisplay, MockReport
+
+
+class _ClassWithNumpydocAttrs:
+    """Class with numpydoc-style Attributes section.
+
+    Parameters
+    ----------
+    param : int
+        Parameter.
+
+    Attributes
+    ----------
+    coef_ : ndarray (n_features,)
+        Coefficients.
+    """
+
+
+class _ClassWithNoDocstring:
+    pass
+
+
+class _ClassWithDocstringMethod:
+    """Helper for get_method_short_summary tests."""
+
+    def documented(self):
+        """First line of docstring."""
+        pass
+
+    def undocumented(self):
+        pass
+
+
+class _ReportWithExplicitMethods(MockReport, _ReportHelpDataMixin):
+    """Report with explicit public, private, and class methods; used for help tests.
+
+    Attributes
+    ----------
+    no_private : object
+        Public attribute for tests.
+    """
+
+    def public_action(self):
+        """A public method."""
+        pass
+
+    def _private_helper(self):
+        pass
+
+    @classmethod
+    def class_factory(cls):
+        """A class method; must be excluded from get_public_methods."""
+        pass
+
+
+class _ReportWithAccessor(_ReportWithExplicitMethods):
+    """Report with _ACCESSOR_CONFIG and attached accessor for _build_help_data
+    coverage.
+    """
+
+    _ACCESSOR_CONFIG = {"metrics": {"name": "metrics"}}
+
+    def __init__(self, estimator, X_train=None, y_train=None, X_test=None, y_test=None):
+        super().__init__(
+            estimator, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test
+        )
+        self.metrics = _AccessorWithExplicitMethods(parent=self)
+
+
+class _AccessorWithExplicitMethods(MockAccessor, _AccessorHelpDataMixin):
+    """Accessor with explicit public, private, and class methods; used for help
+    tests.
+    """
+
+    def fetch(self):
+        """Fetch data."""
+        pass
+
+    def _internal(self):
+        pass
+
+    @classmethod
+    def class_factory(cls):
+        """A class method; must be excluded from get_public_methods."""
+        pass
+
+    def _get_help_title(self) -> str:
+        return "Mock accessor"
+
+
+class _EmptyAccessor(MockAccessor, _AccessorHelpDataMixin):
+    """Accessor with no public methods; used for testing empty accessor exclusion."""
+
+    def _internal(self):
+        """Private method; should not be included."""
+        pass
+
+    def _get_help_title(self) -> str:
+        return "Empty accessor"
+
+
+class _ReportWithEmptyAccessor(_ReportWithExplicitMethods):
+    """Report with _ACCESSOR_CONFIG and empty accessor for testing exclusion."""
+
+    _ACCESSOR_CONFIG = {"empty": {"name": "empty"}}
+
+    def __init__(self, estimator, X_train=None, y_train=None, X_test=None, y_test=None):
+        super().__init__(
+            estimator, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test
+        )
+        self.empty = _EmptyAccessor(parent=self)
+
+
+class _DisplayWithExplicitMethods(MockDisplay, _DisplayHelpDataMixin):
+    """Display with explicit private and class methods; used for help tests."""
+
+    def _private_helper(self):
+        pass
+
+    @classmethod
+    def class_factory(cls):
+        """A class method; must be excluded from get_public_methods."""
+        pass
+
+    def _get_help_title(self) -> str:
+        return "Mock display"
+
+
+@pytest.mark.parametrize(
+    "obj, attribute_name, expected",
+    [
+        (_ClassWithNumpydocAttrs(), "coef_", "ndarray (n_features,)"),
+        (_ClassWithNumpydocAttrs(), "param", "int"),
+        (_ClassWithNoDocstring(), "coef_", None),
+        (_ClassWithNumpydocAttrs(), "other_attr", None),
+    ],
+)
+def test_get_attribute_type(obj, attribute_name, expected):
+    """_get_attribute_type returns the type for numpydoc entries, else None."""
+    assert _get_attribute_type(obj, attribute_name) == expected
+
+
+@pytest.mark.parametrize(
+    "obj, attribute_name, expected",
+    [
+        (
+            _ClassWithNumpydocAttrs(),
+            "coef_",
+            "coef_,-ndarray%20%28n_features%2C%29",
+        ),
+        (_ClassWithNumpydocAttrs(), "param", "param,-int"),
+        (_ClassWithNoDocstring(), "coef_", "coef_"),
+        (_ClassWithNumpydocAttrs(), "other_attr", "other_attr"),
+    ],
+)
+def test_build_attribute_text_fragment(obj, attribute_name, expected):
+    """_build_attribute_text_fragment returns encoded name,-type or encoded name."""
+    assert _build_attribute_text_fragment(obj, attribute_name) == expected
+
+
+@pytest.fixture
+def report_with_methods():
+    """Report with explicit public/private methods; used as main report fixture."""
+    X = np.array([[0, 0], [1, 1], [1, 0], [0, 1]])
+    y = np.array([0, 1, 1, 0])
+    estimator = LogisticRegression().fit(X, y)
+    return _ReportWithExplicitMethods(estimator)
+
+
+@pytest.fixture
+def accessor_with_methods(report_with_methods):
+    """Accessor with explicit public/private methods; used as main accessor
+    fixture.
+    """
+    return _AccessorWithExplicitMethods(parent=report_with_methods)
+
+
+@pytest.fixture
+def display_with_methods():
+    """Display with explicit private method; used as main display fixture."""
+    return _DisplayWithExplicitMethods()
+
+
+@pytest.fixture
+def report_with_accessor():
+    """Report with _ACCESSOR_CONFIG and metrics accessor for _build_help_data tests."""
+    X = np.array([[0, 0], [1, 1], [1, 0], [0, 1]])
+    y = np.array([0, 1, 1, 0])
+    estimator = LogisticRegression().fit(X, y)
+    return _ReportWithAccessor(estimator)
+
+
+def test_get_public_methods_display(display_with_methods):
+    """get_public_methods returns public instance methods, excludes help, private,
+    class.
+    """
+    methods = get_public_methods(display_with_methods)
+    names = [n for n, _ in methods]
+    for excluded in ("help", "_private_helper", "class_factory"):
+        assert excluded not in names
+    for expected in ("frame", "plot", "set_style"):
+        assert expected in names
+    assert names == sorted(names)
+
+
+def test_get_public_methods_report_excludes_help(report_with_methods):
+    """get_public_methods excludes help, private, and class methods, includes public
+    ones.
+    """
+    methods = get_public_methods(report_with_methods)
+    names = [n for n, _ in methods]
+    for excluded in ("help", "_private_helper", "class_factory"):
+        assert excluded not in names
+    assert "public_action" in names
+
+
+def test_get_public_methods_accessor_excludes_help(accessor_with_methods):
+    """get_public_methods excludes help, private, and class methods, includes public
+    ones.
+    """
+    methods = get_public_methods(accessor_with_methods)
+    names = [n for n, _ in methods]
+    for excluded in ("help", "_internal", "class_factory"):
+        assert excluded not in names
+    assert "fetch" in names
+
+
+@pytest.mark.parametrize(
+    "method_name, expected",
+    [
+        ("documented", "First line of docstring."),
+        ("undocumented", "No description available"),
+    ],
+)
+def test_get_method_short_summary(method_name, expected):
+    """get_method_short_summary returns first docstring line or fallback."""
+    method = getattr(_ClassWithDocstringMethod(), method_name)
+    assert get_method_short_summary(method) == expected
+
+
+def test_get_public_attributes_report(report_with_methods):
+    """get_public_attributes returns public non-callable attrs for report."""
+    attrs = get_public_attributes(report_with_methods)
+    for expected in ("no_private", "attr_without_description"):
+        assert expected in attrs
+    assert attrs == sorted(attrs)
+    assert not any(n.startswith("_") for n in attrs)
+
+
+def test_get_public_attributes_display(display_with_methods):
+    """get_public_attributes returns public non-callable attrs for display."""
+    attrs = get_public_attributes(display_with_methods)
+    for excluded in ("plot", "frame"):
+        assert excluded not in attrs
+    assert attrs == sorted(attrs)
+
+
+def test_get_public_attributes_accessor(accessor_with_methods):
+    """get_public_attributes returns public non-callable attrs for accessor."""
+    attrs = get_public_attributes(accessor_with_methods)
+    assert "_parent" not in attrs
+    assert attrs == sorted(attrs)
+
+
+def test_get_attribute_short_summary_numpydoc(report_with_methods):
+    """get_attribute_short_summary extracts description from numpydoc."""
+    # Report has "no_private : object" -> "Public attribute for tests"
+    summary = get_attribute_short_summary(report_with_methods, "no_private")
+    assert "Public attribute" in summary and "tests" in summary
+
+    # _ClassWithNumpydocAttrs has "coef_ : ndarray (...)" -> "Coefficients"
+    obj = _ClassWithNumpydocAttrs()
+    summary = get_attribute_short_summary(obj, "coef_")
+    assert summary == "Coefficients"
+
+
+def test_get_attribute_short_summary_not_found():
+    """get_attribute_short_summary returns fallback when attr not in docstring."""
+    obj = _ClassWithNumpydocAttrs()
+    summary = get_attribute_short_summary(obj, "other_attr")
+    assert summary == "No description available"
+
+
+def test_get_attribute_short_summary_no_docstring():
+    """get_attribute_short_summary returns fallback when no docstring."""
+    obj = _ClassWithNoDocstring()
+    summary = get_attribute_short_summary(obj, "coef_")
+    assert summary == "No description available"
+
+
+def test_get_documentation_url_class_only(report_with_methods, display_with_methods):
+    """get_documentation_url returns base class URL with no accessor/method/
+    attribute.
+    """
+    for obj in (report_with_methods, display_with_methods):
+        url = get_documentation_url(obj=obj)
+        assert re.match(
+            rf"https://docs.skore.probabl.ai/[^/]+/reference/api/skore\.{re.escape(obj.__class__.__name__)}\.html",
+            url,
+        )
+        assert "#" not in url
+
+
+def test_get_documentation_url_method_no_accessor(
+    report_with_methods, display_with_methods
+):
+    """get_documentation_url appends #skore.Class.method when method set, no
+    accessor.
+    """
+    for obj in (report_with_methods, display_with_methods):
+        url = get_documentation_url(obj=obj, method_name="help")
+        assert url.startswith("https://docs.skore.probabl.ai/")
+        assert ".html#" in url
+        assert "#skore." in url and "help" in url
+
+
+def test_get_documentation_url_accessor(report_with_methods):
+    """get_documentation_url includes accessor in path when accessor_name set."""
+    url = get_documentation_url(obj=report_with_methods, accessor_name="data")
+    cls = report_with_methods.__class__.__name__
+    assert f"skore.{cls}.data.html" in url
+    assert "#" not in url
+
+
+def test_get_documentation_url_accessor_and_method(report_with_methods):
+    """get_documentation_url includes accessor and method in path."""
+    url = get_documentation_url(
+        obj=report_with_methods, accessor_name="data", method_name="get_data"
+    )
+    cls = report_with_methods.__class__.__name__
+    assert f"skore.{cls}.data.get_data.html" in url
+    assert "#" not in url
+
+
+def test_get_documentation_url_attribute():
+    """get_documentation_url appends #:~:text= fragment when attribute_name set."""
+    obj = _ClassWithNumpydocAttrs()
+    url = get_documentation_url(obj=obj, attribute_name="coef_")
+    assert url.startswith("https://docs.skore.probabl.ai/")
+    assert ".html#:~:text=" in url
+    assert quote("coef_", safe="") in url
+
+
+@pytest.mark.parametrize(
+    "mocked_version, expected_url_version",
+    [
+        ("0.0.1", "dev"),
+        ("0.0.0.dev0", "dev"),
+        ("0.1.0", "0.1"),
+        ("1.2.3", "1.2"),
+    ],
+)
+def test_get_documentation_url_version_branches(
+    monkeypatch, display_with_methods, mocked_version, expected_url_version
+):
+    """get_documentation_url uses \"dev\" for version < 0.1, else major.minor."""
+    monkeypatch.setattr(
+        "skore._utils.repr.data.version",
+        lambda name: mocked_version,
+    )
+    url = get_documentation_url(obj=display_with_methods)
+    assert url.startswith("https://docs.skore.probabl.ai/")
+    assert f"docs.skore.probabl.ai/{expected_url_version}/reference/api/" in url
+
+
+def test_accessor_build_help_data_output(accessor_with_methods):
+    """_AccessorHelpDataMixin._build_help_data returns AccessorHelpData with expected
+    shape.
+    """
+    data = accessor_with_methods._build_help_data()
+    assert isinstance(data, AccessorHelpData)
+    assert data.title == "Mock accessor"
+    expected_root = accessor_with_methods._parent.__class__.__name__
+    assert data.root_node == expected_root
+    assert data.accessor_name == "mock_accessor"
+    assert data.accessor_branch_id != ""
+    assert len(data.methods) == 1
+    m = data.methods[0]
+    assert m.name == "fetch"
+    assert m.parameters == "()"
+    assert "Fetch" in m.description
+    assert m.doc_url.startswith("https://docs.skore.probabl.ai/")
+    assert "mock_accessor" in m.doc_url and "fetch" in m.doc_url
+
+
+def test_report_build_help_data_output(report_with_methods):
+    """_ReportHelpDataMixin._build_help_data returns ReportHelpData with expected
+    shape.
+    """
+    data = report_with_methods._build_help_data()
+    assert isinstance(data, ReportHelpData)
+    assert data.title == "Mock report"
+    assert data.root_node == "_ReportWithExplicitMethods"
+    assert data.class_name == "_ReportWithExplicitMethods"
+    assert data.accessors == []
+    assert len(data.base_methods) == 1
+    method_names = {m.name for m in data.base_methods}
+    assert method_names == {"public_action"}
+    for m in data.base_methods:
+        assert m.parameters != ""
+        assert m.doc_url.startswith("https://docs.skore.probabl.ai/")
+    assert data.methods_section is not None
+    assert isinstance(data.methods_section, HelpSection)
+    assert data.attributes is not None
+    assert data.attributes_section is not None
+
+
+def test_report_build_help_data_output_with_accessors(report_with_accessor):
+    """_ReportHelpDataMixin._build_help_data with _ACCESSOR_CONFIG builds accessor
+    branches.
+    """
+    data = report_with_accessor._build_help_data()
+    assert isinstance(data, ReportHelpData)
+    assert len(data.accessors) == 1
+    branch = data.accessors[0]
+    assert branch.name == "metrics"
+    assert branch.branch_id != ""
+    assert len(branch.methods) == 1
+    m = branch.methods[0]
+    assert m.name == "fetch"
+    assert m.parameters == "()"
+    assert "Fetch" in m.description
+    assert m.doc_url.startswith("https://docs.skore.probabl.ai/")
+    # URLs come from the accessor's own help data (``_accessor_name``).
+    assert "mock_accessor" in m.doc_url and "fetch" in m.doc_url
+    assert branch.groups is None
+
+
+def test_report_build_help_data_output_excludes_empty_accessor():
+    """_ReportHelpDataMixin._build_help_data excludes accessors with no methods."""
+    X = np.array([[0, 0], [1, 1], [1, 0], [0, 1]])
+    y = np.array([0, 1, 1, 0])
+    estimator = LogisticRegression().fit(X, y)
+    report = _ReportWithEmptyAccessor(estimator)
+    data = report._build_help_data()
+    assert isinstance(data, ReportHelpData)
+    assert len(data.accessors) == 0
+    assert hasattr(report, "empty")
+    assert report.empty is not None
+
+
+def test_display_build_help_data_output(display_with_methods):
+    """_DisplayHelpDataMixin._build_help_data returns DisplayHelpData with expected
+    shape.
+    """
+    data = display_with_methods._build_help_data()
+    assert isinstance(data, DisplayHelpData)
+    assert data.title == "Mock display"
+    assert data.root_node == "_DisplayWithExplicitMethods"
+    assert data.class_name == "_DisplayWithExplicitMethods"
+    assert data.attributes is None
+    assert data.attributes_section is None
+    assert data.methods_section is not None
+    assert isinstance(data.methods_section, HelpSection)
+    assert data.methods is not None
+    assert len(data.methods) == 3
+    names = {m.name for m in data.methods}
+    assert names == {"frame", "plot", "set_style"}
+    for m in data.methods:
+        assert isinstance(m, MethodHelp)
+        assert m.doc_url.startswith("https://docs.skore.probabl.ai/")
+
+
+class _GroupedAccessor(MockAccessor, _AccessorHelpDataMixin):
+    """Accessor declaring ``_HELP_METHOD_GROUPS`` for grouped-help tests.
+
+    References a non-existent method ``"never_existed"`` to verify it is
+    silently skipped.
+    """
+
+    _HELP_METHOD_GROUPS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "Registry": ("alpha", "beta", "never_existed"),
+        "Metrics": ("gamma", "delta"),
+        "Displays": ("epsilon",),
+    }
+
+    def alpha(self):
+        """Alpha method."""
+
+    def beta(self):
+        """Beta method."""
+
+    def gamma(self):
+        """Gamma method."""
+
+    def delta(self):
+        """Delta method."""
+
+    def epsilon(self):
+        """Epsilon method."""
+
+    def _get_help_title(self) -> str:
+        return "Grouped accessor"
+
+
+class _AccessorWithUngroupedMethod(_GroupedAccessor):
+    """Accessor whose ``stray`` method is missing from ``_HELP_METHOD_GROUPS``."""
+
+    def stray(self):
+        """Stray method not in any declared group."""
+
+
+class _AccessorWithExtraHelpMethods(_GroupedAccessor):
+    """Accessor exposing extra help entries, as accessors using ``__getattr__`` do.
+
+    ``alpha`` duplicates a statically discovered method to check deduplication.
+    """
+
+    def _extra_help_methods(self):
+        return [
+            MethodHelp(name="dynamic", parameters="(...)", description="Dynamic."),
+            MethodHelp(name="alpha", parameters="(...)", description="Duplicate."),
+        ]
+
+    def _help_method_group_spec(self):
+        group_spec = dict(self._HELP_METHOD_GROUPS)
+        group_spec["Metrics"] = ("dynamic", *group_spec["Metrics"])
+        return group_spec
+
+
+class _ReportWithGroupedAccessor(_ReportWithExplicitMethods):
+    """Report carrying a single accessor that exposes grouped methods."""
+
+    _ACCESSOR_CONFIG = {"metrics": {"name": "metrics"}}
+
+    def __init__(self, estimator, X_train=None, y_train=None, X_test=None, y_test=None):
+        super().__init__(
+            estimator, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test
+        )
+        self.metrics = _GroupedAccessor(parent=self)
+
+
+@pytest.fixture
+def grouped_accessor():
+    """Accessor that declares `_HELP_METHOD_GROUPS`."""
+    X = np.array([[0, 0], [1, 1], [1, 0], [0, 1]])
+    y = np.array([0, 1, 1, 0])
+    estimator = LogisticRegression().fit(X, y)
+    return _GroupedAccessor(parent=_ReportWithExplicitMethods(estimator))
+
+
+@pytest.fixture
+def report_with_grouped_accessor():
+    """Report whose accessor declares `_HELP_METHOD_GROUPS`."""
+    X = np.array([[0, 0], [1, 1], [1, 0], [0, 1]])
+    y = np.array([0, 1, 1, 0])
+    estimator = LogisticRegression().fit(X, y)
+    return _ReportWithGroupedAccessor(estimator)
+
+
+def test_accessor_build_help_data_groups(grouped_accessor):
+    """`_AccessorHelpDataMixin._build_help_data` populates `groups` when the accessor
+    declares `_HELP_METHOD_GROUPS`.
+    """
+    data = grouped_accessor._build_help_data()
+    assert data.groups is not None
+    group_names = [g.name for g in data.groups]
+    assert group_names == ["Registry", "Metrics", "Displays"]
+    for g in data.groups:
+        assert isinstance(g, MethodGroupHelp)
+        assert g.branch_id != ""
+
+    by_name = {g.name: [m.name for m in g.methods] for g in data.groups}
+    assert by_name["Registry"] == ["alpha", "beta"]
+    assert by_name["Metrics"] == ["gamma", "delta"]
+    assert by_name["Displays"] == ["epsilon"]
+
+
+def test_accessor_build_help_data_groups_cover_all_methods(grouped_accessor):
+    """Every public method of a grouped accessor lands in exactly one group."""
+    data = grouped_accessor._build_help_data()
+    grouped_names = [m.name for group in data.groups for m in group.methods]
+
+    assert sorted(grouped_names) == sorted(m.name for m in data.methods)
+    assert len(grouped_names) == len(set(grouped_names))
+
+
+def test_accessor_build_help_data_groups_raise_when_method_ungrouped():
+    """A method missing from `_HELP_METHOD_GROUPS` raises instead of being dropped."""
+    X = np.array([[0, 0], [1, 1], [1, 0], [0, 1]])
+    y = np.array([0, 1, 1, 0])
+    estimator = LogisticRegression().fit(X, y)
+    accessor = _AccessorWithUngroupedMethod(
+        parent=_ReportWithExplicitMethods(estimator)
+    )
+
+    with pytest.raises(ValueError, match="does not list stray"):
+        accessor._build_help_data()
+
+
+def test_accessor_build_help_data_extra_methods(grouped_accessor):
+    """``_extra_help_methods`` entries are added once and grouped in a single pass."""
+    accessor = _AccessorWithExtraHelpMethods(parent=grouped_accessor._parent)
+
+    data = accessor._build_help_data()
+
+    names = [method.name for method in data.methods]
+    assert "dynamic" in names
+    # A static method of the same name wins over the extra entry.
+    assert names.count("alpha") == 1
+    alpha = next(method for method in data.methods if method.name == "alpha")
+    assert alpha.description != "Duplicate."
+
+    by_name = {g.name: [m.name for m in g.methods] for g in data.groups}
+    assert by_name["Metrics"] == ["dynamic", "gamma", "delta"]
+
+
+def test_accessor_build_help_data_groups_computed_once(grouped_accessor, monkeypatch):
+    """Grouping runs a single time per accessor help build."""
+    calls = []
+    original = data_module._build_method_groups
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(data_module, "_build_method_groups", counting)
+    _AccessorWithExtraHelpMethods(parent=grouped_accessor._parent)._build_help_data()
+
+    assert len(calls) == 1
+
+
+def test_accessor_build_help_data_groups_none_when_not_declared(accessor_with_methods):
+    """`groups` is `None` when the accessor does not declare `_HELP_METHOD_GROUPS`."""
+    data = accessor_with_methods._build_help_data()
+    assert data.groups is None
+
+
+def test_report_build_help_data_groups(report_with_grouped_accessor):
+    """`_ReportHelpDataMixin._build_help_data` propagates `groups` to each accessor
+    branch.
+    """
+    data = report_with_grouped_accessor._build_help_data()
+    assert len(data.accessors) == 1
+    branch = data.accessors[0]
+    assert branch.groups is not None
+    assert [g.name for g in branch.groups] == ["Registry", "Metrics", "Displays"]
+
+
+def test_report_build_help_data_groups_none_when_not_declared(report_with_accessor):
+    """`groups` is `None` for accessors not declaring `_HELP_METHOD_GROUPS`."""
+    data = report_with_accessor._build_help_data()
+    assert len(data.accessors) == 1
+    assert data.accessors[0].groups is None

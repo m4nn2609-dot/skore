@@ -1,0 +1,355 @@
+"""Tests for CrossValidationReport.metrics.summarize() method.
+
+These tests focus on testing the data aggregation logic of summarize()
+without depending on MetricsSummaryDisplay.frame().
+"""
+
+import numpy as np
+import pandas as pd
+import pytest
+from numpy.testing import assert_array_equal
+
+from skore import CrossValidationReport, MetricsSummaryDisplay
+
+
+def check_display_structure(
+    display,
+    *,
+    expected_metrics,
+    expected_estimator=None,
+    expected_data_source="test",
+    expected_greater_is_better=None,
+):
+    """
+    Helper function to check the structure of a MetricsSummaryDisplay.summary DataFrame.
+
+    Parameters
+    ----------
+    display : MetricsSummaryDisplay
+        The display object to check.
+    expected_metrics : set, optional
+        Expected set of metric names.
+    expected_estimator : str, optional
+        Expected estimator name.
+    expected_data_source : str, default="test"
+        Expected data source value.
+    expected_greater_is_better : set, optional
+        Expected set of greater-is-better flags.
+    """
+    assert isinstance(display, MetricsSummaryDisplay)
+    assert isinstance(display.summary, pd.DataFrame)
+    data = display.summary
+
+    assert set(data.columns) == {
+        "split",
+        "name",
+        "verbose_name",
+        "estimator",
+        "data_source",
+        "label",
+        "average",
+        "output",
+        "score",
+        "greater_is_better",
+    }
+    assert set(data["verbose_name"]) == expected_metrics
+    assert set(data["estimator"]) == {expected_estimator}
+    assert set(data["data_source"]) == {expected_data_source}
+    assert set(data["split"]) == {0, 1}
+    assert pd.api.types.is_numeric_dtype(data["score"])
+    assert pd.api.types.is_integer_dtype(data["split"])
+    if expected_greater_is_better is None:
+        assert set(data["greater_is_better"]) == {True, False}
+    else:
+        assert set(data["greater_is_better"]) == expected_greater_is_better
+
+
+# Tests for the happy path, with different ML tasks
+
+
+def test_binary_classification_forest(forest_binary_classification_data):
+    """
+    Check the behaviour of summarize() with binary classification using
+    RandomForestClassifier.
+    """
+    estimator, X, y = forest_binary_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Log loss",
+            "Brier score",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="RandomForestClassifier",
+    )
+
+    data = display.summary.set_index(["split", "verbose_name"]).sort_index()
+    assert len(data.loc[(0, "Precision")]) == 2
+    assert len(data.loc[(0, "Recall")]) == 2
+
+    assert set(display.summary.set_index("verbose_name").loc["Precision", "label"]) == {
+        0,
+        1,
+    }
+    assert display.summary["output"].isna().all()
+
+
+def test_binary_classification_svc(svc_binary_classification_data):
+    """
+    Check the behaviour of summarize() with binary classification using SVC
+    (no predict_proba).
+    """
+    estimator, X, y = svc_binary_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2, pos_label=1)
+    display = report.metrics.summarize()
+
+    # No Brier score for SVC
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="SVC",
+    )
+
+
+def test_multiclass_classification_forest(forest_multiclass_classification_data):
+    """
+    Check the behaviour of summarize() with multiclass classification using
+    RandomForestClassifier.
+    """
+    estimator, X, y = forest_multiclass_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Log loss",
+            "Precision",
+            "Recall",
+            "ROC AUC",
+            "Predict time (s)",
+            "Fit time (s)",
+        },
+        expected_estimator="RandomForestClassifier",
+    )
+
+    assert display.summary["output"].isna().all()
+
+    data = display.summary.set_index(["split", "verbose_name"]).sort_index()
+    # 3 classes per split (macro aggregate rows are stored separately)
+    per_label = data.loc[(0, "Precision")].dropna(subset=["label"])
+    assert (
+        set(per_label["label"])
+        == set(data.loc[(0, "Recall")].dropna(subset=["label"])["label"])
+        == set(data.loc[(0, "ROC AUC")].dropna(subset=["label"])["label"])
+        == {0, 1, 2}
+    )
+
+
+def test_multiclass_classification_svc(svc_multiclass_classification_data):
+    """Check the behaviour of summarize() with multiclass classification using SVC."""
+    estimator, X, y = svc_multiclass_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Accuracy",
+            "Precision",
+            "Recall",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="SVC",
+    )
+
+    assert display.summary["output"].isna().all()
+
+    data = display.summary.set_index(["split", "verbose_name"]).sort_index()
+    assert len(data.loc[(0, "Precision")].dropna(subset=["label"])) == 3
+    assert len(data.loc[(0, "Recall")].dropna(subset=["label"])) == 3
+
+
+def test_regression(linear_regression_data):
+    """Check the behaviour of summarize() with regression."""
+    estimator, X, y = linear_regression_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "R²",
+            "RMSE",
+            "MAE",
+            "MAPE",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="LinearRegression",
+    )
+
+    assert display.summary["label"].isna().all()
+    assert display.summary["output"].isna().all()
+
+
+def test_multioutput_regression(linear_regression_multioutput_data):
+    """Check the behaviour of summarize() with multioutput regression."""
+    estimator, X, y = linear_regression_multioutput_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "R²",
+            "RMSE",
+            "MAE",
+            "MAPE",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="LinearRegression",
+    )
+
+    assert display.summary["label"].isna().all()
+
+    data = display.summary.set_index(["split", "verbose_name"]).sort_index()
+    assert len(data.loc[(0, "R²")]) == 2
+    assert set(data.loc[(0, "R²"), "output"]) == {0, 1}
+
+
+def test_without_predict_proba(custom_classifier_no_predict_proba_data):
+    """Default metrics skip roc_auc, log_loss, and brier_score without predict_proba."""
+    estimator, X, y = custom_classifier_no_predict_proba_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    display = report.metrics.summarize()
+
+    check_display_structure(
+        display,
+        expected_metrics={
+            "Precision",
+            "Accuracy",
+            "Recall",
+            "Fit time (s)",
+            "Predict time (s)",
+        },
+        expected_estimator="CustomClassifierPredictOnly",
+    )
+
+
+def test_data_source_both(forest_binary_classification_data):
+    """`data_source='both'` should keep train and test metrics separate."""
+    estimator, X, y = forest_binary_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+    train_display = report.metrics.summarize(data_source="train")
+    test_display = report.metrics.summarize(data_source="test")
+    both_display = report.metrics.summarize(data_source="both")
+
+    assert set(both_display.summary["data_source"]) == {"train", "test"}
+
+    train_data = both_display.summary[both_display.summary["data_source"] == "train"]
+    assert_array_equal(train_data["score"], train_display.summary["score"])
+
+    test_data = both_display.summary[both_display.summary["data_source"] == "test"]
+    assert_array_equal(test_data["score"], test_display.summary["score"])
+
+
+# Tests about default metric behavior
+
+
+def test_default_multioutput_regression(linear_regression_multioutput_data):
+    """Default summarize() produces per-output rows for multioutput regression."""
+    estimator, X, y = linear_regression_multioutput_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+
+    display = report.metrics.summarize()
+    assert isinstance(display, MetricsSummaryDisplay)
+
+    # Each metric should have 2 outputs per split
+    assert (
+        len(
+            display.summary.set_index(["split", "verbose_name"])
+            .sort_index()
+            .loc[(0, "R²")]
+        )
+        == 2
+    )
+
+
+def test_default_multiclass_classification(forest_multiclass_classification_data):
+    """Default summarize() produces per-class rows for multiclass classification."""
+    estimator, X, y = forest_multiclass_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=2)
+
+    display = report.metrics.summarize()
+    assert isinstance(display, MetricsSummaryDisplay)
+
+    assert (
+        len(
+            display.summary.set_index(["split", "verbose_name"])
+            .sort_index()
+            .loc[(0, "Precision")]
+            .dropna(subset=["label"])
+        )
+        == 3
+    )
+
+
+# Tests about passing `pos_label`
+
+
+@pytest.mark.parametrize("metric", ["precision", "recall"])
+def test_pos_label_overwrite(metric, logistic_binary_classification_data):
+    """Check that `pos_label` can be overwritten in `summarize`."""
+    classifier, X, y = logistic_binary_classification_data
+    labels = np.array(["A", "B"], dtype=object)
+    y = labels[y]
+
+    # Map internal names to display names
+    metric_display_name = {"precision": "Precision", "recall": "Recall"}[metric]
+
+    # Without pos_label
+    report = CrossValidationReport(classifier, X=X, y=y, splitter=2)
+    display = report.metrics.summarize(metric=metric)
+
+    data = display.summary.set_index(["split", "verbose_name"]).sort_index()
+    assert data.loc[(0, metric_display_name), "label"].to_list() == ["A", "B"]
+
+    # With pos_label
+    report = CrossValidationReport(classifier, X=X, y=y, splitter=2, pos_label="A")
+    display = report.metrics.summarize(metric=metric)
+
+    assert len(display.summary) == 2  # One line per split
+    assert display.summary["label"].isna().all()
+
+
+def test_non_default_n_jobs(forest_binary_classification_data):
+    """summarize() must work when the report uses process-based parallelism.
+
+    Joblib must not pickle a bound metrics-accessor method; that used to recurse
+    while unpickling ``__getattr__`` / ``available()`` in worker processes.
+    """
+    estimator, X, y = forest_binary_classification_data
+    report = CrossValidationReport(estimator, X=X, y=y, splitter=5, n_jobs=2)
+    display = report.metrics.summarize()
+
+    assert isinstance(display, MetricsSummaryDisplay)
+    assert set(display.summary["split"]) == {0, 1, 2, 3, 4}
